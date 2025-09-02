@@ -6,7 +6,7 @@ from torch.utils.data import DataLoader, random_split
 
 
 import lightning.pytorch as pl
-from lightning.pytorch.callbacks import ModelCheckpoint
+from lightning.pytorch.callbacks import ModelCheckpoint, Callback
 from lightning.pytorch.loggers import WandbLogger
 from lightning.pytorch import Trainer
 
@@ -17,8 +17,60 @@ from torch.optim import Adam
 from torchmetrics.functional import accuracy
 
 import os
-import ast
+import sys
+import glob 
+import logging
 import argparse
+
+import boto3
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+logger.addHandler(logging.StreamHandler(sys.stdout))
+
+sagemaker_client = boto3.client('sagemaker')
+
+def get_tags_of_training_job(training_job_arn:str):
+    response = sagemaker_client.list_tags(ResourceArn=training_job_arn)
+    tags = {}
+    for tag in response['Tags']:
+        tags[tag['Key']] = tag['Value']
+    return tags
+
+def put_tags_of_training_job(training_job_arn:str, entity: str, project: str, checkpoint_name: str):
+    logger.info("tag_training_job() is invoked")
+    response = sagemaker_client.add_tags(
+        ResourceArn=training_job_arn,
+        Tags=[
+            {'Key': "WANDB_ENTITY", "Value": entity},
+            {'Key': "WANDB_PROJECT", "Value": project},
+            {'Key': "WANDB_CHECKPOINT_NAME", "Value": checkpoint_name}
+        ]
+    )
+
+class SageMakerTrainingJobTaggingCallback(Callback):
+
+    def __init__(self, training_job_arn:str):
+        self.tagging_done = False
+        self.training_job_arn = training_job_arn
+
+    def on_save_checkpoint(self, trainer, pl_module, checkpoint):
+        logger.info("on_save_checkpoint() is invoked.")
+        checkpoint_name = trainer.logger._checkpoint_name
+        # for saving a checkpoint for epoch '0', the checkpoint name is not generated yet.
+        to_tag_training_job = (checkpoint_name is not None) and (not self.tagging_done)
+        logger.info(f"{to_tag_training_job=}")
+        if to_tag_training_job: 
+            self.tagging_done = True
+            entity = trainer.logger._experiment.entity
+            project = trainer.logger._project
+
+            # put tags on training job
+            put_tags_of_training_job(self.training_job_arn, entity, project, checkpoint_name)
+        else:
+            # checkpoint name is not generated at wandb server side yet.
+            pass
 
 class MNIST_LitModule(pl.LightningModule):
 
@@ -101,14 +153,6 @@ class MNIST_LitModule(pl.LightningModule):
     def configure_optimizers(self):
         return Adam(self.parameters(), lr=self.lr)
 
-    def on_save_checkpoint(self, checkpoint):
-        super().on_save_checkpoint(checkpoint)
-        print("!!!LightningModule-Checkpoint!!!")
-        print("checkpoint name", self.logger._checkpoint_name)
-        print("project", self.logger._project)
-        print("name", self.logger._name)
-        print("entity", self.logger._experiment.entity)
-
 def load_data():
     transform = transforms.Compose([
         transforms.ToTensor(),
@@ -123,34 +167,59 @@ def load_data():
     return training_loader, validation_loader
 
 def training(args):
+
+
+    # Verify the checkpoint tag
+    # when checkpoint_name tag exists on training, we simplify set tag to the latest when training job is restarted
+    # otherwise, we read the data from environment variables
+    training_job_arn = os.environ.get('TRAINING_JOB_ARN')
+    training_job_tags = get_tags_of_training_job(training_job_arn)
+
+    if "WANDB_CHECKPOINT_NAME" in training_job_tags:
+        wandb_project = training_job_tags['WANDB_PROJECT']
+        wandb_checkpoint_name = training_job_tags['WANDB_CHECKPOINT_NAME']
+        wandb_checkpoint_tag = "latest"
+    else:
+        wandb_project = os.environ.get("WANDB_PROJECT")
+        # if not None, we resume the training from checkpoint.
+        wandb_checkpoint_name = os.environ.get("WANDB_CHECKPOINT_NAME", None) 
+        # for the training job starts, it may load specified checkpoint version. by default is 'latest'
+        wandb_checkpoint_tag = os.environ.get("WANDB_CHECKPOINT_TAG", "latest") 
+
+    wandb_logger = WandbLogger(project=wandb_project, log_model="all")
+
+    if wandb_checkpoint_name is not None:
+        logger.info("----Download & Load checkpoint----")
+        wandb_entity = wandb_logger.experiment.entity
+        checkpoint_reference = f"{wandb_entity}/{wandb_project}/{wandb_checkpoint_name}:{wandb_checkpoint_tag}"
+        download_artefact_path = wandb_logger.download_artifact(checkpoint_reference, artifact_type="model")
+        # load checkpoint
+        model_artifacts = glob.glob(f"{download_artefact_path}/*.ckpt")
+        model = MNIST_LitModule.load_from_checkpoint(model_artifacts[0]) 
+    else:
+        model = MNIST_LitModule(n_layer_1=128, n_layer_2=128)
+
+    # callback for checkpoint and tagging
     checkpoint_callback = ModelCheckpoint(
         dirpath="/opt/ml/checkpoint", 
         filename="{epoch:03d}",
         monitor='val_accuracy', 
         mode='max')
-
-    wandb_project_name = os.environ.get("WANDB_PROJECT_NAME")
-    wandb_logger = WandbLogger(project=wandb_project_name, log_model="all")
-
-    wandb_checkpoint_name = os.environ.get("WANDB_CHECKPOINT_NAME", None) # if not None, we resume the training from checkpoint.
-    wandb_checkpoint_tag = os.environ.get("WANDB_CHECKPOINT_TAG", "latest")
+    tagging_callback = SageMakerTrainingJobTaggingCallback(training_job_arn)
 
     trainer = Trainer(
         logger=wandb_logger,
-        callbacks=[checkpoint_callback],
+        callbacks=[checkpoint_callback, tagging_callback],
         accelerator="gpu",
         max_epochs=args.epochs
     )    
 
-    model = MNIST_LitModule(n_layer_1=128, n_layer_2=128)
-
     training_loader, validation_loader = load_data()
-
     trainer.fit(model, training_loader, validation_loader)
 
     wandb.finish()
 
-def loging_wandb(wandb_secret_name: str):
+def login_wandb(wandb_secret_name: str):
     import boto3
     import json
     from botocore.exceptions import ClientError
@@ -169,25 +238,11 @@ def loging_wandb(wandb_secret_name: str):
         for key, value in secret.items():
             os.environ[key] = value
             
-        print(f"Successfully loaded secret {wandb_secret_name}")
+        logger.info(f"Successfully loaded secret {wandb_secret_name}")
     except ClientError as e:
-        print(f"Error loading secret {wandb_secret_name}: {str(e)}")
+        logger.info(f"Error loading secret {wandb_secret_name}: {str(e)}")
     
     wandb.login()
-
-def get_env_var_value(key:str) -> str:
-    if key in os.environ.keys():
-        return os.environ[key]
-    else:
-        return None
-
-def get_wandb_parameters():
-
-    parser.add_argument("--wandb-secret-name", type=str, default=os.environ["WANDB_SECRET_NAME"])
-    parser.add_argument("--wandb-project-name", type=str, default=os.environ["WANDB_PROJECT_NAME"])
-    parser.add_argument("--wandb-checkpoint-name", type=str, default=os.environ["WANDB_CHECKPOINT_NAME"])
-    parser.add_argument("--wandb-checkpoint-tag", type=str, default=os.environ["WANDB_CHECKPOINT_TAG"])
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -195,7 +250,7 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=5)
 
     secret_name = os.environ.get("WANDB_SECRET_NAME")
-    loging_wandb(secret_name)
+    login_wandb(secret_name)
 
     args = parser.parse_args()
     training(args)
